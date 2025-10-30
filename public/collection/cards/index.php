@@ -36,6 +36,26 @@ function validateID()
     return $id;
 }
 
+function readBody(): array
+{
+    $raw = file_get_contents("php://input");
+    $ct  = $_SERVER['CONTENT_TYPE'] ?? $_SERVER['HTTP_CONTENT_TYPE'] ?? '';
+
+    if (stripos($ct, 'application/json') !== false) {
+        $data = json_decode($raw, true);
+        return is_array($data) ? $data : [];
+    }
+
+    // fallback for form-urlencoded
+    $data = [];
+    parse_str($raw, $data);
+    // but if it's a normal POST form (multipart or classic), PHP already filled $_POST
+    if (empty($data) && !empty($_POST)) {
+        return $_POST;
+    }
+    return $data;
+}
+
 if ($_SERVER["REQUEST_METHOD"] === "GET" && empty($_GET["id"])) {
     header("Content-Type: application/json; charset=utf-8");
 
@@ -102,16 +122,14 @@ if ($_SERVER["REQUEST_METHOD"] === "GET" && !empty($_GET["id"])) {
             cards.power,
             cards.defense,
             cards.description,
+            cards.abilities,
             GROUP_CONCAT(mana.color) AS cost,
-            GROUP_CONCAT(DISTINCT type.type)  AS types,
-            GROUP_CONCAT(DISTINCT ability.ability SEPARATOR '|||') AS abilities
+            GROUP_CONCAT(DISTINCT type.type)  AS types
         FROM cards
         LEFT JOIN card_mana     ON cards.id = card_mana.card_id
         LEFT JOIN mana          ON card_mana.mana_id = mana.id
         LEFT JOIN card_type     ON cards.id = card_type.card_id
         LEFT JOIN type          ON card_type.type_id = type.id
-        LEFT JOIN card_ability  ON cards.id = card_ability.card_id 
-        LEFT JOIN ability       ON card_ability.ability_id = ability.id
         WHERE cards.id = :id
         GROUP BY cards.id
         ");
@@ -150,19 +168,17 @@ if ($_SERVER["REQUEST_METHOD"] === "GET" && !empty($_GET["id"])) {
                 }
             }
         }
+
             $abilityList = [];
         if (!empty($row['abilities'])) {
-            $parts = array_map('trim', explode('|||', $row['abilities']));
-            $unique = [];
-            foreach ($parts as $t) {
-                if ($t === '') {
-                    continue;
-                }
-                $key = strtolower($t);
-                if (!isset($unique[$key])) {
-                    $unique[$key] = true;
-                    $abilityList[] = strtolower($t);
-                }
+            $decoded = json_decode($row["abilities"], true);
+            if (is_array($decoded)) {
+                $abilityList = array_values(
+                    array_filter(
+                        array_map('trim', $decoded),
+                        fn($a) => $a !== ''
+                    )
+                );
             }
         }
             $row['types'] = [
@@ -185,16 +201,19 @@ if ($_SERVER["REQUEST_METHOD"] === "GET" && !empty($_GET["id"])) {
 if ($_SERVER["REQUEST_METHOD"] === "POST") {
     header("Content-Type: application/json; charset=utf-8");
 
-    $name = trim($_POST["name"] ?? '');
-    $power = array_key_exists('power', $_POST) ? trim((string)$_POST["power"]) : null;
-    $defense = array_key_exists('defense', $_POST) ? trim((string)$_POST["defense"]) : null;
-    $power = ($power === '' || $power === null) ? null : (int)$power;
-    $defense = ($defense === '' || $defense === null) ? null : (int)$defense;
-    $description = array_key_exists('description', $_POST) ? trim((string)$_POST['description']) : null;
+    $data = readBody();   // <--- use helper
+
+    $name        = trim($data["name"] ?? '');
+    $powerRaw    = $data["power"]   ?? null;
+    $defenseRaw  = $data["defense"] ?? null;
+    $power       = ($powerRaw === '' || $powerRaw === null) ? null : (int)$powerRaw;
+    $defense     = ($defenseRaw === '' || $defenseRaw === null) ? null : (int)$defenseRaw;
+    $description = array_key_exists('description', $data) ? trim((string)$data['description']) : null;
     $description = ($description === '') ? null : $description;
-    $manaCosts = $_POST["mana"] ?? [];
-    $types = $_POST["types"] ?? $_POST['type'] ?? [];
-    $abilities = $_POST["abilities"] ?? $_POST["ability"] ?? [];
+
+    $manaCosts = $data["mana"]  ?? [];
+    $types     = $data["types"] ?? $data["type"] ?? [];
+    $abilities = $data["abilities"] ?? $data["ability"] ?? [];
 
     if (is_array($manaCosts)) {
         $cleanMana = [];
@@ -211,15 +230,35 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
         $manaCosts = $cleanMana;
     }
 
+    $abilityList = [];
+    if (is_array($abilities)) {
+        foreach ($abilities as $a) {
+            $a = trim((string)$a);
+            if ($a !== '') {
+                $abilityList[] = $a;
+            }
+        }
+    } elseif (is_string($abilities)) {
+        $abilities = trim($abilities);
+        if ($abilities !== '') {
+            $abilityList[] = $abilities;
+        }
+    }
+
+    $abilitiesJson = !empty($abilityList)
+        ? json_encode($abilityList, JSON_UNESCAPED_UNICODE)
+        : null;
+
     $stmt = $conn->prepare("
-        INSERT INTO cards (name, power, defense, description)
-        VALUES (:name, :power, :defense, :description)
+        INSERT INTO cards (name, power, defense, description, abilities)
+        VALUES (:name, :power, :defense, :description, :abilities)
     ");
 
     $stmt->bindParam(":name", $name);
     $stmt->bindParam(":power", $power, $power === null ? PDO::PARAM_NULL : PDO::PARAM_INT);
     $stmt->bindParam(":defense", $defense, $defense === null ? PDO::PARAM_NULL : PDO::PARAM_INT);
     $stmt->bindParam(":description", $description, $description === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+    $stmt->bindParam(":abilities", $abilitiesJson, $abilitiesJson === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
 
     $stmt->execute();
     $card_id = (int)$conn->lastInsertId();
@@ -265,28 +304,6 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
         }
     }
 
-    if (!empty($abilities) && is_array($abilities)) {
-        $normalizedAbilities = [];
-        foreach ($abilities as $key => $value) {
-            $abilityName = is_numeric($key) ? trim((string)$value) : trim((string)$key);
-            if ($abilityName !== '') {
-                $normalizedAbilities[strtolower($abilityName)] = $abilityName;
-            }
-        }
-
-        if ($normalizedAbilities) {
-            $findAbility  = $conn->prepare("SELECT id FROM ability WHERE LOWER(ability) = LOWER(:a) LIMIT 1");
-            $linkAbility  = $conn->prepare("INSERT IGNORE INTO card_ability (card_id, ability_id) VALUES (:c, :a)");
-            foreach ($normalizedAbilities as $abilityName) {
-                $findAbility->execute([':a' => $abilityName]);
-                $abilityId = $findAbility->fetchColumn();
-                if ($abilityId) {
-                    $linkAbility->execute([':c' => $card_id, ':a' => (int)$abilityId]);
-                }
-            }
-        }
-    }
-
     http_response_code(201);
     echo json_encode([
     "message" => "Card created",
@@ -295,7 +312,7 @@ if ($_SERVER["REQUEST_METHOD"] === "POST") {
     "power" => $power,
     "defense" => $defense,
     "description" => $description,
-    "abilities" => array_values($normalizedAbilities ?? []),
+    "abilities" => $abilityList,
     "mana" => $manaCosts,
     "types" => array_values($normalized ?? [])
     ]);
@@ -322,7 +339,7 @@ if ($_SERVER["REQUEST_METHOD"] === "PUT") {
 
     $id = intval($id, 10);
 
-    parse_str(file_get_contents("php://input"), $data);
+    $data = readBody();
 
     $name = $data["name"];
     $power = array_key_exists('power', $data) ? trim((string)$data["power"]) : null;
@@ -331,9 +348,10 @@ if ($_SERVER["REQUEST_METHOD"] === "PUT") {
     $defense = ($defense === '' || $defense === null) ? null : (int)$defense;
     $description = array_key_exists('description', $data) ? trim((string)$data['description']) : null;
     $description = ($description === '') ? null : $description;
+    $abilities = $data["abilities"] ?? $data["ability"] ?? null;
+
     $mana = $data["mana"] ?? null;
     $types = $data["types"] ?? null;
-    $abilities = $data["types"] ?? null;
 
     if (is_array($mana)) {
         $cleanMana = [];
@@ -350,6 +368,25 @@ if ($_SERVER["REQUEST_METHOD"] === "PUT") {
         $mana = $cleanMana;
     }
 
+    $abilitiesJson = null;
+    if (is_array($abilities)) {
+        $cleanAbilities = [];
+        foreach ($abilities as $a) {
+            $a = trim((string)$a);
+            if ($a !== '') {
+                $cleanAbilities[] = $a;
+            }
+        }
+        if (!empty($cleanAbilities)) {
+            $abilitiesJson = json_encode($cleanAbilities, JSON_UNESCAPED_UNICODE);
+        }
+    } elseif (is_string($abilities)) {
+        $abilities = trim($abilities);
+        if ($abilities !== '') {
+            $abilitiesJson = json_encode([$abilities], JSON_UNESCAPED_UNICODE);
+        }
+    }
+
     if ($id) {
         $stmt = $conn->prepare("
             UPDATE cards
@@ -358,6 +395,7 @@ if ($_SERVER["REQUEST_METHOD"] === "PUT") {
             power = :power, 
             defense = :defense,
             description = :description,
+            abilities = :abilities
             WHERE id = :id
             ");
 
@@ -365,6 +403,7 @@ if ($_SERVER["REQUEST_METHOD"] === "PUT") {
         $stmt->bindParam(":power", $power, $power === null ? PDO::PARAM_NULL : PDO::PARAM_INT);
         $stmt->bindParam(":defense", $defense, $defense === null ? PDO::PARAM_NULL : PDO::PARAM_INT);
         $stmt->bindParam(":description", $description, $description === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
+        $stmt->bindParam(":abilities", $abilitiesJson, $abilitiesJson === null ? PDO::PARAM_NULL : PDO::PARAM_STR);
         $stmt->bindParam(":id", $id, PDO::PARAM_INT);
 
         $stmt->execute();
@@ -380,16 +419,22 @@ if ($_SERVER["REQUEST_METHOD"] === "PUT") {
                 $mana_id = $findMana->fetchColumn();
                 if ($mana_id) {
                     for ($i = 0; $i < (int)$count; $i++) {
-                        $addMana->execute([":card" => $id, ":mana" => $mana_id]);
+                        $addMana->execute([
+                            ":card" => $id,
+                            ":mana" => $mana_id
+                        ]);
                     }
                 }
             }
+        } else {
+            // PUT without mana → clear mana
+            $conn->prepare("DELETE FROM card_mana WHERE card_id = :id")->execute([":id" => $id]);
         }
 
 
-        // --- Update types ---
+
+        // ----- types -----
         if ($types && is_array($types)) {
-            // Remove old types
             $conn->prepare("DELETE FROM card_type WHERE card_id = :id")->execute([":id" => $id]);
 
             $findType = $conn->prepare("SELECT id FROM type WHERE LOWER(type) = LOWER(:t) LIMIT 1");
@@ -399,32 +444,21 @@ if ($_SERVER["REQUEST_METHOD"] === "PUT") {
                 $findType->execute([":t" => $t]);
                 $type_id = $findType->fetchColumn();
                 if ($type_id) {
-                    $addType->execute([":card" => $id, ":type" => $type_id]);
+                    $addType->execute([
+                        ":card" => $id,
+                        ":type" => $type_id
+                    ]);
                 }
             }
-        }
-
-        // --- Update abilities ---
-        if ($abilities && is_array($abilities)) {
-            // Remove old abilities
-            $conn->prepare("DELETE FROM card_ability WHERE card_id = :id")->execute([":id" => $id]);
-
-            $findAbility = $conn->prepare("SELECT id FROM ability WHERE LOWER(ability) = LOWER(:a) LIMIT 1");
-            $addAbility = $conn->prepare("INSERT INTO card_ability (card_id, ability_id) VALUES (:card, :ability)");
-
-            foreach ($abilities as $a) {
-                $findAbility->execute([":t" => $a]);
-                $ability_id = $findAbility->fetchColumn();
-                if ($ability_id) {
-                    $addAbility->execute([":card" => $id, ":ability" => $ability_id]);
-                }
-            }
+        } else {
+            // PUT without types → clear types
+            $conn->prepare("DELETE FROM card_type WHERE card_id = :id")->execute([":id" => $id]);
         }
 
 
-        echo "Card updated";
+        echo json_encode(["message" => "Card Updated"]);
     } else {
-        echo "missing id";
+        echo json_encode(["message" => "Missing ID"]);
     }
 }
 
@@ -439,10 +473,17 @@ if ($_SERVER["REQUEST_METHOD"] === "PATCH") {
     }
     $id = (int)$_GET["id"];
 
-    // parse x-www-form-urlencoded body
-    $raw = file_get_contents("php://input");
-    $data = [];
-    parse_str($raw, $data);
+    $data = readBody();
+
+    // DEBUG GUARD (keep while testing)
+    if (!is_array($data) || $data === []) {
+        http_response_code(400);
+        echo json_encode([
+            "message" => "PATCH body was empty or not JSON/form",
+            "got" => $data
+        ]);
+        exit;
+    }
 
     // Build dynamic UPDATE only for provided scalar fields
     $fields = [];
@@ -478,6 +519,31 @@ if ($_SERVER["REQUEST_METHOD"] === "PATCH") {
         $params[':description'] = ($val === '') ? null : $val; // empty ⇒ NULL
     }
 
+    // abilities as JSON (new)
+    if (array_key_exists('abilities', $data) || array_key_exists('ability', $data)) {
+        $abilitiesInput = $data['abilities'] ?? $data['ability'];
+
+        // normalize to array of non-empty strings
+        $abilityList = [];
+        if (is_array($abilitiesInput)) {
+            foreach ($abilitiesInput as $a) {
+                $a = trim((string)$a);
+                if ($a !== '') {
+                    $abilityList[] = $a;
+                }
+            }
+        } else { // single string
+            $abilitiesInput = trim((string)$abilitiesInput);
+            if ($abilitiesInput !== '') {
+                $abilityList[] = $abilitiesInput;
+            }
+        }
+
+        $fields[] = "abilities = :abilities";
+        $params[':abilities'] = !empty($abilityList)
+            ? json_encode($abilityList, JSON_UNESCAPED_UNICODE)
+            : null;
+    }
 
     if ($fields) {
         $sql = "UPDATE cards SET " . implode(", ", $fields) . " WHERE id = :id";
@@ -576,138 +642,6 @@ if ($_SERVER["REQUEST_METHOD"] === "PATCH") {
             }
         }
     }
-
-    // ----- PATCH: abilities -----
-// 1) Full replace if `abilities` or `ability` is provided (backward compatible)
-    if (array_key_exists('abilities', $data) || array_key_exists('ability', $data)) {
-        $abilitiesInput = $data['abilities'] ?? $data['ability'] ?? null;
-        if (is_string($abilitiesInput)) {
-            $abilitiesInput = [$abilitiesInput];
-        }
-        if (!is_array($abilitiesInput)) {
-            $abilitiesInput = [];
-        }
-
-        $cleanAbilities = [];
-        foreach ($abilitiesInput as $k => $v) {
-            $s = is_numeric($k) ? (string)$v : (string)$k;
-            $s = trim($s);
-            if ($s !== '') {
-                $cleanAbilities[strtolower($s)] = $s;
-            }
-        }
-
-        // replace semantics: clear then insert
-        $conn->prepare("DELETE FROM card_ability WHERE card_id = :id")->execute([":id" => $id]);
-
-        if (!empty($cleanAbilities)) {
-            // upsert to get id reliably
-            $upsertAbility = $conn->prepare("
-            INSERT INTO ability (ability) VALUES (:a)
-            ON DUPLICATE KEY UPDATE id = LAST_INSERT_ID(id)
-        ");
-            $checkLink  = $conn->prepare("SELECT 1 FROM card_ability WHERE card_id = :card AND ability_id = :ability LIMIT 1");
-            $insLink    = $conn->prepare("INSERT INTO card_ability (card_id, ability_id) VALUES (:card, :ability)");
-
-            foreach ($cleanAbilities as $name) {
-                $upsertAbility->execute([':a' => $name]);
-                $abilityId = (int)$conn->lastInsertId();
-                $checkLink->execute([':card' => $id, ':ability' => $abilityId]);
-                if (!$checkLink->fetchColumn()) {
-                    $insLink->execute([':card' => $id, ':ability' => $abilityId]);
-                }
-            }
-        }
-    }
-
-// 2) Fine-grained merge ops: add/remove/replace (only if provided)
-    $toAddRaw    = $data['abilities_add']    ?? $data['ability_add']    ?? null;
-    $toRemoveRaw = $data['abilities_remove'] ?? $data['ability_remove'] ?? null;
-    $toReplace   = $data['abilities_replace'] ?? null; // expects assoc: old => new
-
-    $normalizeList = function ($in) {
-        $out = [];
-        if ($in === null) {
-            return $out;
-        }
-        if (is_string($in)) {
-            $in = [$in];
-        }
-        if (!is_array($in)) {
-            return $out;
-        }
-        foreach ($in as $k => $v) {
-            $s = is_numeric($k) ? (string)$v : (string)$k;
-            $s = trim($s);
-            if ($s !== '') {
-                $out[strtolower($s)] = $s; // de-dupe case-insensitively
-            }
-        }
-        return array_values($out);
-    };
-
-    $toAdd    = $normalizeList($toAddRaw);
-    $toRemove = $normalizeList($toRemoveRaw);
-
-    if (!empty($toAdd) || !empty($toRemove) || (is_array($toReplace) && !empty($toReplace))) {
-        $upsertAbility = $conn->prepare("
-        INSERT INTO ability (ability) VALUES (:a)
-        ON DUPLICATE KEY UPDATE id = LAST_INSERT_ID(id)
-    ");
-        $findAbility  = $conn->prepare("SELECT id FROM ability WHERE LOWER(ability) = LOWER(:a) LIMIT 1");
-        $checkLink    = $conn->prepare("SELECT 1 FROM card_ability WHERE card_id = :card AND ability_id = :ability LIMIT 1");
-        $insLink      = $conn->prepare("INSERT INTO card_ability (card_id, ability_id) VALUES (:card, :ability)");
-        $delLink      = $conn->prepare("DELETE FROM card_ability WHERE card_id = :card AND ability_id = :ability");
-
-        // Add
-        foreach ($toAdd as $name) {
-            $upsertAbility->execute([':a' => $name]);
-            $abilityId = (int)$conn->lastInsertId();
-            $checkLink->execute([':card' => $id, ':ability' => $abilityId]);
-            if (!$checkLink->fetchColumn()) {
-                $insLink->execute([':card' => $id, ':ability' => $abilityId]);
-            }
-        }
-
-        // Remove
-        foreach ($toRemove as $name) {
-            $findAbility->execute([':a' => $name]);
-            $abilityId = $findAbility->fetchColumn();
-            if ($abilityId) {
-                $delLink->execute([':card' => $id, ':ability' => (int)$abilityId]);
-            }
-        }
-
-        // Replace (exact text match: old -> new)
-        if (is_array($toReplace)) {
-            foreach ($toReplace as $old => $new) {
-                $old = trim((string)$old);
-                $new = trim((string)$new);
-                if ($old === '' || $new === '') {
-                    continue;
-                }
-
-                // Ensure new ability exists -> get id
-                $upsertAbility->execute([':a' => $new]);
-                $newId = (int)$conn->lastInsertId();
-
-                // Find old id
-                $findAbility->execute([':a' => $old]);
-                $oldId = $findAbility->fetchColumn();
-                if (!$oldId) {
-                    continue;
-                }
-
-                // If already linked to new, just remove old link; else add new link then remove old
-                $checkLink->execute([':card' => $id, ':ability' => $newId]);
-                if (!$checkLink->fetchColumn()) {
-                    $insLink->execute([':card' => $id, ':ability' => $newId]);
-                }
-                $delLink->execute([':card' => $id, ':ability' => (int)$oldId]);
-            }
-        }
-    }
-
 
     echo json_encode(["message" => "Card patched (PATCH)", "id" => $id]);
     exit;
